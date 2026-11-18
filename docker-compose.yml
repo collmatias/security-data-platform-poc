@@ -1,0 +1,276 @@
+# =============================================================================
+# Security Data Platform PoC
+#
+#   producer -> Redpanda (Kafka) -> Kafka Connect S3 Sink -> MinIO bronze (raw JSON)
+#            -> Spark ETL (Glue) -> MinIO silver/gold (Delta Lake) + Redis (ElastiCache)
+#            -> Trino (Athena) for threat hunting
+#
+# Resource budget (sum of limits ~16 GiB / reservations ~8 GiB) sized for a
+# 32 GiB workstation. See docs/04-resources-and-tuning.md.
+# =============================================================================
+
+name: secdata-poc
+
+x-minio-env: &minio-env
+  AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+  AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+  AWS_REGION: us-east-1
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # Ingestion: Redpanda (Kafka API compatible, single binary, no ZooKeeper)
+  # ---------------------------------------------------------------------------
+  redpanda:
+    image: redpandadata/redpanda:v24.2.7
+    container_name: redpanda
+    command:
+      - redpanda
+      - start
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr=internal://redpanda:9092,external://localhost:19092
+      - --smp=1
+      - --memory=1G              # Seastar memory; container limit leaves headroom
+      - --reserve-memory=0M
+      - --overprovisioned
+      - --default-log-level=warn
+      - --mode=dev-container
+    ports:
+      - "19092:19092"            # Kafka API for clients on the host
+      - "9644:9644"              # Admin API
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    deploy:
+      resources:
+        limits:       { cpus: "2.0", memory: 2G }
+        reservations: { cpus: "1.0", memory: 1G }
+    networks: [secdata]
+
+  # One-shot: create the topic explicitly (3 partitions, 7d retention). Without
+  # this, the S3 sink would auto-create it with a single partition.
+  redpanda-init:
+    image: redpandadata/redpanda:v24.2.7
+    container_name: redpanda-init
+    depends_on:
+      redpanda: { condition: service_healthy }
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - >-
+        rpk topic list -X brokers=redpanda:9092 | grep -q '^${KAFKA_TOPIC} ' ||
+        rpk topic create ${KAFKA_TOPIC} -p 3 -r 1 -c retention.ms=604800000 -X brokers=redpanda:9092;
+        rpk topic describe ${KAFKA_TOPIC} -X brokers=redpanda:9092 -p
+    restart: "no"
+    deploy:
+      resources:
+        limits: { cpus: "0.25", memory: 128M }
+    networks: [secdata]
+
+  # ---------------------------------------------------------------------------
+  # Object storage: MinIO (S3 API). Upstream minio/minio images are no longer
+  # published on Docker Hub, so we use the frozen Bitnami legacy build.
+  # ---------------------------------------------------------------------------
+  minio:
+    image: bitnamilegacy/minio:2025.4.22
+    container_name: minio
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    ports:
+      - "9000:9000"              # S3 API
+      - "9001:9001"              # Web console
+    volumes:
+      - minio-data:/bitnami/minio/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:9000/minio/health/live || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    deploy:
+      resources:
+        limits:       { cpus: "1.0", memory: 1G }
+        reservations: { cpus: "0.25", memory: 256M }
+    networks: [secdata]
+
+  # One-shot: create the data lake bucket (idempotent).
+  minio-init:
+    image: bitnamilegacy/minio-client:2025.4.16
+    container_name: minio-init
+    depends_on:
+      minio: { condition: service_healthy }
+    environment:
+      MC_HOST_lake: http://${MINIO_ROOT_USER}:${MINIO_ROOT_PASSWORD}@minio:9000
+    entrypoint: ["/bin/bash", "-c"]
+    command: ["mc mb --ignore-existing lake/${LAKE_BUCKET_NAME} && mc ls lake"]
+    restart: "no"
+    deploy:
+      resources:
+        limits: { cpus: "0.5", memory: 128M }
+    networks: [secdata]
+
+  # ---------------------------------------------------------------------------
+  # Bronze writer: Kafka Connect + Confluent S3 Sink (buffers by size/time)
+  # ---------------------------------------------------------------------------
+  kafka-connect:
+    build: ./kafka-connect
+    image: secdata/kafka-connect:7.7.1-s3
+    container_name: kafka-connect
+    depends_on:
+      redpanda-init: { condition: service_completed_successfully }
+      minio-init: { condition: service_completed_successfully }
+    ports:
+      - "8083:8083"              # Connect REST API
+    environment:
+      <<: *minio-env
+      CONNECT_BOOTSTRAP_SERVERS: redpanda:9092
+      CONNECT_REST_ADVERTISED_HOST_NAME: kafka-connect
+      CONNECT_REST_PORT: 8083
+      CONNECT_GROUP_ID: secdata-connect
+      CONNECT_CONFIG_STORAGE_TOPIC: _connect-configs
+      CONNECT_OFFSET_STORAGE_TOPIC: _connect-offsets
+      CONNECT_STATUS_STORAGE_TOPIC: _connect-status
+      CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      CONNECT_STATUS_STORAGE_REPLICATION_FACTOR: 1
+      CONNECT_KEY_CONVERTER: org.apache.kafka.connect.storage.StringConverter
+      CONNECT_VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
+      CONNECT_PLUGIN_PATH: /usr/share/java,/usr/share/confluent-hub-components
+      CONNECT_LOG4J_ROOT_LOGLEVEL: WARN
+      CONNECT_LOG4J_LOGGERS: org.apache.kafka.connect.runtime.rest=WARN,io.confluent.connect.s3=INFO
+      KAFKA_HEAP_OPTS: -Xms512m -Xmx1g
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:8083/connector-plugins | grep -q S3SinkConnector"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    deploy:
+      resources:
+        limits:       { cpus: "2.0", memory: 2G }
+        reservations: { cpus: "0.5", memory: 1G }
+    networks: [secdata]
+
+  # One-shot: register (upsert) the S3 sink connector.
+  connect-init:
+    image: curlimages/curl:8.11.1
+    container_name: connect-init
+    depends_on:
+      kafka-connect: { condition: service_healthy }
+    volumes:
+      - ./scripts/register-connector.sh:/register-connector.sh:ro
+      - ./kafka-connect/connectors:/connectors:ro
+    entrypoint: ["/bin/sh", "/register-connector.sh"]
+    restart: "no"
+    deploy:
+      resources:
+        limits: { cpus: "0.25", memory: 64M }
+    networks: [secdata]
+
+  # ---------------------------------------------------------------------------
+  # Fast serving: Redis (simulates ElastiCache) for <10ms indicator lookups
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7.4-alpine
+    container_name: redis
+    command:
+      - redis-server
+      - --maxmemory 384mb
+      - --maxmemory-policy volatile-lru   # evict TTL'd threat intel first
+      - --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    deploy:
+      resources:
+        limits:       { cpus: "1.0", memory: 512M }
+        reservations: { cpus: "0.25", memory: 128M }
+    networks: [secdata]
+
+  # ---------------------------------------------------------------------------
+  # Processing: Spark 3.5 + Delta Lake (simulates AWS Glue). Idle container;
+  # jobs are launched with `docker compose exec spark spark-submit ...`.
+  # ---------------------------------------------------------------------------
+  spark:
+    build: ./spark
+    image: secdata/spark:3.5.3-delta
+    container_name: spark
+    depends_on:
+      minio-init: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+    environment:
+      <<: *minio-env
+      REDIS_HOST: redis
+      THREAT_THRESHOLD: "80"
+    command: ["sleep", "infinity"]
+    ports:
+      - "4040:4040"              # Spark UI (only while a job runs)
+    volumes:
+      - ./spark/jobs:/opt/spark/jobs:ro
+      - spark-checkpoints:/opt/spark/checkpoints
+    deploy:
+      resources:
+        limits:       { cpus: "6.0", memory: 6G }
+        reservations: { cpus: "2.0", memory: 3G }
+    networks: [secdata]
+
+  # ---------------------------------------------------------------------------
+  # OLAP: Trino (simulates Athena) over bronze (Hive/JSON) and silver/gold (Delta)
+  # ---------------------------------------------------------------------------
+  trino:
+    image: trinodb/trino:470
+    container_name: trino
+    depends_on:
+      minio-init: { condition: service_completed_successfully }
+    environment:
+      <<: *minio-env
+    ports:
+      - "8080:8080"              # Web UI + REST
+    volumes:
+      - ./trino/catalog/hive.properties:/etc/trino/catalog/hive.properties:ro
+      - ./trino/catalog/delta.properties:/etc/trino/catalog/delta.properties:ro
+      - ./trino/sql:/opt/sql:ro
+      - ./scripts:/opt/scripts:ro
+    # The image ships with a HEALTHCHECK; the JVM uses MaxRAMPercentage=80 of the limit (~3.2 GiB heap).
+    deploy:
+      resources:
+        limits:       { cpus: "4.0", memory: 4G }
+        reservations: { cpus: "1.0", memory: 2G }
+    networks: [secdata]
+
+  # ---------------------------------------------------------------------------
+  # Event generator (on demand): docker compose run --rm producer --count 50000
+  # ---------------------------------------------------------------------------
+  producer:
+    build: ./producer
+    image: secdata/producer:latest
+    profiles: ["tools"]
+    depends_on:
+      redpanda: { condition: service_healthy }
+    environment:
+      KAFKA_BOOTSTRAP: redpanda:9092
+      KAFKA_TOPIC: ${KAFKA_TOPIC}
+    deploy:
+      resources:
+        limits: { cpus: "1.0", memory: 256M }
+    networks: [secdata]
+
+networks:
+  secdata:
+    name: secdata
+
+volumes:
+  redpanda-data:
+  minio-data:
+  redis-data:
+  spark-checkpoints:
