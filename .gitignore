@@ -1,15 +1,38 @@
-# Python
+# NOTE: runtime data (Kafka, MinIO lake, Redis, Spark checkpoints) lives in Docker
+# named volumes, not in this folder, and code folders are mounted read-only.
+# These rules cover what can still appear when working locally.
+
+# Python (e.g. running producer.py from the host)
 __pycache__/
 *.py[cod]
 .venv/
 venv/
+.pytest_cache/
+.ipynb_checkpoints/
 
-# Editors / OS
+# Spark / Hive artifacts if PySpark is ever run on the host
+spark-warehouse/
+metastore_db/
+derby.log
+checkpoints/
+
+# Query exports and ad-hoc outputs (e.g. trino --output-format CSV > file.csv)
+*.csv
+*.parquet
+*.json.gz
+exports/
+out/
+
+# Editors / OS / atomic-save temp files
 .idea/
 .vscode/
 *.swp
+*.tmp
+*.tmp.*
+*~
 .DS_Store
 
-# Local overrides
+# Local overrides and logs
 docker-compose.override.yml
+.env.local
 *.log
