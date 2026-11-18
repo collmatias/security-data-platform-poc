@@ -14,7 +14,7 @@ Start with **Quickstart** if you just want it running. Each other file covers on
 | 04 | [Resources & Tuning](04-resources-and-tuning.md) | CPU/RAM limits per container, Docker Engine / Desktop settings |
 | 05 | [Bronze Layer (Kafka Connect)](05-bronze-kafka-connect.md) | S3 Sink buffering, small-file problem, rotation settings |
 | 06 | [Spark ETL](06-spark-etl.md) | Incremental processing, idempotency, batch vs stream mode, maintenance |
-| 07 | [Trino / Threat Hunting](07-trino-queries.md) | Catalogs, table registration, sample hunting queries |
+| 07 | [Trino / Threat Hunting](07-trino-queries.md) | Catalogs, table registration, manual querying (CLI, DBeaver, Python), sample hunting queries |
 | 08 | [Operations & Troubleshooting](08-operations.md) | UIs, health checks, logs, reset, common errors |
 | 09 | [Decisions & Limitations](09-decisions-and-limitations.md) | Why each technology/config was chosen, what differs from production |
 

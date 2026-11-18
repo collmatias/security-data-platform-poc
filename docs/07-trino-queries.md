@@ -34,6 +34,68 @@ docker compose exec trino bash /opt/scripts/register-tables.sh
 `register_table` fails if the table already exists, so the script checks
 `information_schema` first. That makes the script safe to re-run.
 
+## Running queries manually
+
+The Trino CLI is bundled in the `trino` container (`trino --version` → 470). You
+don't need to download the CLI jar or install Java on the host.
+
+### Interactive shell
+
+```bash
+docker compose exec trino trino --catalog delta --schema lake
+```
+
+```sql
+SHOW CATALOGS;                 -- delta, hive, system
+SHOW TABLES;                   -- security_events, threat_indicators
+DESCRIBE security_events;
+
+SELECT indicator, hits, max_threat_score
+FROM threat_indicators
+WHERE indicator_type = 'ip'
+ORDER BY hits DESC
+LIMIT 10;
+
+-- Other catalogs need fully qualified names
+SELECT count(*) FROM hive.bronze.security_events_raw;
+```
+
+Exit with `quit;` or `Ctrl+D`. Without `--catalog/--schema`, always use
+`catalog.schema.table` (e.g. `delta.lake.security_events`).
+
+### One-off query
+
+```bash
+docker compose exec trino trino --execute "SELECT count(*) FROM delta.lake.security_events"
+```
+
+### Run a `.sql` file
+
+`trino/sql/` is mounted at `/opt/sql` inside the container, so put files there:
+
+```bash
+docker compose exec trino trino -f /opt/sql/02_threat_hunting.sql
+```
+
+### Output formats / export
+
+`--output-format` accepts `ALIGNED` (readable table), `CSV`, `CSV_HEADER`,
+`TSV`, `TSV_HEADER`, `JSON`, and others. Use `-T` (no TTY) when redirecting to a file:
+
+```bash
+docker compose exec -T trino trino --output-format CSV_HEADER \
+  --execute "SELECT * FROM delta.lake.threat_indicators" > indicators.csv
+```
+
+### Other clients
+
+| Client | Connection | Notes |
+|--------|------------|-------|
+| DBeaver / DataGrip | JDBC `jdbc:trino://localhost:8080`, any user, no password | The closest thing to the Athena console: editor, autocomplete, result grid |
+| Python | `pip install trino` → `trino.dbapi.connect(host="localhost", port=8080, user="me", catalog="delta", schema="lake")` | Notebooks, scripts, pandas |
+| Host CLI jar | `java -jar trino-cli-470-executable.jar --server localhost:8080` | Needs a local Java runtime. Not needed here because the container CLI is equivalent. |
+| Web UI | http://localhost:8080 | Monitoring only (running queries, stages, plans), not a SQL editor |
+
 ## Sample queries
 
 All in [`trino/sql/02_threat_hunting.sql`](../trino/sql/02_threat_hunting.sql):
