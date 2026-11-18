@@ -63,6 +63,62 @@ SELECT count(*) FROM hive.bronze.security_events_raw;
 Exit with `quit;` or `Ctrl+D`. Without `--catalog/--schema`, always use
 `catalog.schema.table` (e.g. `delta.lake.security_events`).
 
+### Exploring what already exists (metadata queries)
+
+Every query below was tested against the running lab. Run them from the
+interactive shell, or wrap them in `--execute "..."`.
+
+```sql
+-- Catalogs and schemas
+SHOW CATALOGS;                                   -- delta, hive, system
+SHOW SCHEMAS FROM delta;                         -- information_schema, lake
+SHOW SCHEMAS FROM hive;                          -- bronze, ...
+
+-- Tables in one schema
+SHOW TABLES FROM delta.lake;                     -- security_events, threat_indicators
+SHOW TABLES FROM hive.bronze;                    -- security_events_raw
+
+-- Every lake table across both catalogs, in one result
+SELECT table_cat, table_schem, table_name
+FROM system.jdbc.tables
+WHERE table_cat IN ('delta', 'hive') AND table_schem <> 'information_schema'
+ORDER BY 1, 2, 3;
+
+-- Same idea, standard SQL, one catalog at a time
+SELECT table_schema, table_name
+FROM delta.information_schema.tables
+WHERE table_schema <> 'information_schema';
+
+-- Structure of a table
+DESCRIBE delta.lake.security_events;             -- alias: SHOW COLUMNS FROM ...
+SHOW CREATE TABLE delta.lake.security_events;    -- DDL incl. S3 location and partitioning
+
+-- Quick data preview
+SELECT * FROM delta.lake.threat_indicators LIMIT 10;
+```
+
+Trino also exposes **metadata tables**. Append `$<name>` to the table name and
+wrap it in double quotes:
+
+```sql
+-- Bronze: which dt/hr partitions are registered (re-run register-tables.sh if one is missing)
+SELECT * FROM hive.bronze."security_events_raw$partitions";
+
+-- Delta: commit history (CREATE / WRITE / MERGE / OPTIMIZE, ...) = what Spark did
+SELECT version, timestamp, operation
+FROM delta.lake."threat_indicators$history"
+ORDER BY version;
+
+-- Delta: table properties (protocol versions, etc.)
+SELECT * FROM delta.lake."security_events$properties";
+
+-- Column statistics from the Delta log (row count, min/max) without scanning data
+SHOW STATS FOR delta.lake.security_events;
+```
+
+When working in the interactive shell with `--catalog delta --schema lake`,
+you can drop the prefix (e.g. `SHOW TABLES;`, `DESCRIBE security_events;`).
+
 ### One-off query
 
 ```bash
